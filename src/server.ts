@@ -2,6 +2,7 @@ import fastify, { FastifyInstance, FastifyRequest, FastifyReply } from "fastify"
 import cors from "@fastify/cors";
 import { openApiSpec } from "./openapi-spec.js";
 import { store, User, BankAccount, Transaction, Card } from "./store.js";
+import { hashPassword, verifyPassword, createJwtToken, verifyJwtToken } from "./auth.js";
 
 export function buildServer(): FastifyInstance {
   const app = fastify({
@@ -27,16 +28,26 @@ export function buildServer(): FastifyInstance {
     });
   });
 
-  // Auth Helper
+  // Auth Helper: verifies JWT signature or falls back to seeded token
   const extractUser = (req: FastifyRequest): User | null => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return null;
     const parts = authHeader.split(" ");
     const token = parts.length === 2 ? parts[1] : parts[0];
+    if (!token) return null;
+
+    // 1. Try verifying as signed JWT
+    const payload = verifyJwtToken(token);
+    if (payload?.sub) {
+      const user = store.getUserById(payload.sub);
+      if (user) return user;
+    }
+
+    // 2. Direct token lookup fallback for seeded tokens
     return store.getUserByToken(token) || null;
   };
 
-  // 1. Auth Register
+  // 1. Auth Register (Real salted scrypt password hashing + signed JWT issuance)
   app.post("/api/v1/auth/register", async (req: FastifyRequest<{
     Body: { username?: string; email?: string; password?: string };
   }>, reply) => {
@@ -49,17 +60,33 @@ export function buildServer(): FastifyInstance {
       });
     }
 
+    const existing = store.getUserByUsername(username);
+    if (existing) {
+      return reply.status(409).send({
+        error: "Conflict",
+        message: "Username already exists",
+        statusCode: 409,
+      });
+    }
+
     const userId = `usr-${Date.now().toString(36)}`;
-    const token = `vbnk_token_${username}_${Date.now()}`;
+    const { hash, salt } = hashPassword(password);
+    const token = createJwtToken({
+      sub: userId,
+      username,
+      role: "customer",
+    });
+
     const newUser: User = {
       id: userId,
       username,
       email,
-      passwordHash: password,
+      passwordHash: hash,
+      salt,
       role: "customer",
       token,
     };
-    store.users.set(userId, newUser);
+    store.createUser(newUser);
 
     // Create default checking account for user
     const accId = `acc-${Date.now().toString(36)}`;
@@ -73,7 +100,7 @@ export function buildServer(): FastifyInstance {
       overdraftLimit: 500.0,
       createdAt: new Date().toISOString(),
     };
-    store.accounts.set(accId, newAccount);
+    store.createAccount(newAccount);
 
     return reply.status(201).send({
       userId,
@@ -83,16 +110,21 @@ export function buildServer(): FastifyInstance {
     });
   });
 
-  // 2. Auth Login
+  // 2. Auth Login (Real password verification + signed JWT issuance)
   app.post("/api/v1/auth/login", async (req: FastifyRequest<{
     Body: { username?: string; password?: string };
   }>, reply) => {
     const { username, password } = req.body || {};
-    const user = Array.from(store.users.values()).find(
-      (u) => u.username === username && u.passwordHash === password
-    );
+    if (!username || !password) {
+      return reply.status(400).send({
+        error: "Bad Request",
+        message: "Username and password are required",
+        statusCode: 400,
+      });
+    }
 
-    if (!user) {
+    const user = store.getUserByUsername(username);
+    if (!user || !verifyPassword(password, user.passwordHash, user.salt)) {
       return reply.status(401).send({
         error: "Unauthorized",
         message: "Invalid username or password",
@@ -100,9 +132,16 @@ export function buildServer(): FastifyInstance {
       });
     }
 
+    // Issue a freshly signed JWT token
+    const token = createJwtToken({
+      sub: user.id,
+      username: user.username,
+      role: user.role,
+    });
+
     return reply.status(200).send({
       userId: user.id,
-      token: user.token,
+      token,
       role: user.role,
     });
   });
@@ -118,9 +157,7 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    const userAccounts = Array.from(store.accounts.values()).filter(
-      (a) => a.userId === user.id
-    );
+    const userAccounts = store.listAccountsByUserId(user.id);
     return reply.status(200).send(userAccounts);
   });
 
@@ -138,7 +175,7 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    const account = store.accounts.get(req.params.id);
+    const account = store.getAccountById(req.params.id);
     if (!account) {
       return reply.status(404).send({
         error: "Not Found",
@@ -165,7 +202,7 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    const account = store.accounts.get(req.params.id);
+    const account = store.getAccountById(req.params.id);
     if (!account) {
       return reply.status(404).send({
         error: "Not Found",
@@ -174,14 +211,13 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    if (typeof req.body?.balance === "number") {
-      account.balance = req.body.balance;
-    }
-    if (typeof req.body?.overdraftLimit === "number") {
-      account.overdraftLimit = req.body.overdraftLimit;
-    }
+    const updated = store.updateAccountBalance(
+      req.params.id,
+      typeof req.body?.balance === "number" ? req.body.balance : undefined,
+      typeof req.body?.overdraftLimit === "number" ? req.body.overdraftLimit : undefined
+    );
 
-    return reply.status(200).send(account);
+    return reply.status(200).send(updated ?? account);
   });
 
   // 6. Transfers (VULNERABILITIES: Missing rate limit + client status override)
@@ -212,8 +248,8 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    const source = store.accounts.get(sourceAccountId);
-    const dest = store.accounts.get(destinationAccountId);
+    const source = store.getAccountById(sourceAccountId);
+    const dest = store.getAccountById(destinationAccountId);
 
     if (!source) {
       return reply.status(400).send({
@@ -238,8 +274,8 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    source.balance -= amount;
-    dest.balance += amount;
+    store.updateAccountBalance(sourceAccountId, source.balance - amount);
+    store.updateAccountBalance(destinationAccountId, dest.balance + amount);
 
     const tx: Transaction = {
       id: `tx-${Date.now().toString(36)}`,
@@ -253,7 +289,7 @@ export function buildServer(): FastifyInstance {
       timestamp: new Date().toISOString(),
     };
 
-    store.transactions.push(tx);
+    store.createTransaction(tx);
     return reply.status(200).send(tx);
   });
 
@@ -271,15 +307,9 @@ export function buildServer(): FastifyInstance {
     }
 
     const { accountId, limit } = req.query;
-    let list = store.transactions;
-    if (accountId) {
-      list = list.filter(
-        (t) => t.sourceAccountId === accountId || t.destinationAccountId === accountId
-      );
-    }
-
     const maxItems = Number(limit) || 20;
-    return reply.status(200).send(list.slice(0, maxItems));
+    const list = store.listTransactions(accountId, maxItems);
+    return reply.status(200).send(list);
   });
 
   // 8. Cards List (VULNERABILITY: Sensitive Data Leakage - Plain PAN and CVV)
@@ -293,7 +323,7 @@ export function buildServer(): FastifyInstance {
       });
     }
 
-    const cards = Array.from(store.cards.values()).filter((c) => c.userId === user.id);
+    const cards = store.listCardsByUserId(user.id);
     // VULNERABILITY: Returns raw pan and cvv in plain text!
     return reply.status(200).send(cards);
   });
@@ -331,12 +361,12 @@ export function buildServer(): FastifyInstance {
       expiration: "12/29",
       isActive: true,
     };
-    store.cards.set(cardId, newCard);
+    store.createCard(newCard);
 
     return reply.status(201).send(newCard);
   });
 
-  // 10. Audit Search (VULNERABILITY: SQL Injection Signal + High Latency + Unauthenticated)
+  // 10. Audit Search (VULNERABILITY: Real SQLite SQL Injection Signal + Latency + Unauthenticated)
   app.get("/api/v1/audit/search", async (req: FastifyRequest<{
     Querystring: { query?: string };
   }>, reply) => {
@@ -345,24 +375,22 @@ export function buildServer(): FastifyInstance {
     // Simulate database lookup latency (180ms - 220ms)
     await new Promise((resolve) => setTimeout(resolve, 180));
 
-    // SQL Injection detection signal
-    if (/['";]|--|\/\*|select|union|drop|insert/i.test(query)) {
+    try {
+      const logs = store.searchAuditLogs(query);
+      return reply.status(200).send({
+        query,
+        matchesCount: logs.length,
+        logs,
+      });
+    } catch (err: unknown) {
+      const errorObj = err as Error;
       return reply.status(500).send({
         error: "Internal Server Error",
-        message: `SQL syntax error near '${query}': syntax error in SQL statement SELECT * FROM audit_logs WHERE message LIKE '%${query}%'`,
+        message: `SQL syntax error near '${query}': syntax error in SQL statement SELECT * FROM audit_logs WHERE (message LIKE '%${query}%') AND level = 'info'`,
         statusCode: 500,
-        trace: `SqliteError: syntax error at QueryContext.execute (/app/src/db/sqlite.ts:42:15)\n    at searchAuditLogs (/app/src/routes/audit.ts:18:22)`,
+        trace: `SqliteError: ${errorObj.message}\n${errorObj.stack || ""}`,
       });
     }
-
-    return reply.status(200).send({
-      query,
-      matchesCount: 2,
-      logs: [
-        `[2026-09-27T10:00:00Z] System integrity check executed for cluster`,
-        `[2026-09-27T12:00:00Z] Automated backup archive created for database`,
-      ],
-    });
   });
 
   // 11. System Metrics (VULNERABILITY: Unauthenticated Info Disclosure)
@@ -371,7 +399,7 @@ export function buildServer(): FastifyInstance {
       uptimeSec: process.uptime(),
       memoryUsageMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       activeDbConnections: 4,
-      totalTransfersCount: store.transactions.length,
+      totalTransfersCount: store.getTransactionsCount(),
     });
   });
 
